@@ -149,18 +149,28 @@ class RunModel:
     
     # initialize
 
-    zeros = lambda shape: np.zeros(shape, dtype=np.float16)
+    # NOTE: ColabFold originally allocated these recycling buffers as
+    # ``np.float16`` for memory savings.  On the jax-cuda12 plugin pinned
+    # by bioemu (0.4.35), XLA inserts an unsupported bf16->f16 cast when
+    # the bf16 Evoformer interacts with these f16 inputs, crashing with
+    # ``LLVM ERROR: Unsupported rounding mode for conversion`` at apply_fn
+    # JIT-compile time.  With ``num_recycle=0`` (the BioEmu default) these
+    # buffers are zeros that never carry information across iterations, so
+    # promoting them to float32 keeps the whole apply_fn graph in f32 and
+    # eliminates the broken cast.  Same reasoning for the inter-iteration
+    # cast in ``_jnp_to_np``.
+    zeros = lambda shape: np.zeros(shape, dtype=np.float32)
     prev = {'prev_msa_first_row': zeros([L,256]),
             'prev_pair':          zeros([L,L,128]),
             'prev_pos':           zeros([L,37,3])}
-    
+
     def run(key, feat, prev):
       def _jnp_to_np(x):
         for k, v in x.items():
           if isinstance(v, dict):
             x[k] = _jnp_to_np(v)
           else:
-            x[k] = np.asarray(v,np.float16)
+            x[k] = np.asarray(v, np.float32)
         return x
       result = _jnp_to_np(self.apply(self.params, key, {**feat, "prev":prev}))
       prev = result.pop("prev", prev)

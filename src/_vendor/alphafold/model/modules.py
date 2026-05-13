@@ -2043,44 +2043,180 @@ class EmbeddingsAndEvoformer(hk.Module):
         evoformer_masks['msa'] = jnp.concatenate(
             [evoformer_masks['msa'], torsion_angle_mask], axis=0)
 
-      # Main trunk of the network
+      # Main trunk of the network — split into two halves so the openfold2
+      # CSDModule can sit between them.  Blocks 0 .. csd_block_idx run with
+      # the full MSA; CSD then partitions the MSA into n_clusters subsets
+      # and the remaining blocks run in a batched / vmapped form, one
+      # cluster per batch element.  When CSD is disabled the two halves
+      # are simply chained, so behaviour matches a single 48-block stack.
       # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 17-18
-      evoformer_iteration = EvoformerIteration(
-          c.evoformer, gc, is_extra_msa=False, name='evoformer_iteration')
+      #
+      # NOTE on parameter paths: a haiku ``Module`` remembers the path it was
+      # created under, not where it is later called from.  So if we share one
+      # ``EvoformerIteration`` instance between two layer_stacks, both stacks
+      # would fight over the same ``evoformer/evoformer_iteration/...``
+      # params (one wanting a [12, ...] leading axis, the other [36, ...]).
+      # We therefore create two distinct inner Modules named
+      # ``evoformer_iteration_first`` and ``evoformer_iteration_second`` so
+      # their param paths are disjoint and match the sliced pretrained
+      # weights produced by ``_split_evoformer_iteration_params``.
+      evoformer_iteration_first = EvoformerIteration(
+          c.evoformer, gc, is_extra_msa=False, name='evoformer_iteration_first')
+      evoformer_iteration_second = EvoformerIteration(
+          c.evoformer, gc, is_extra_msa=False, name='evoformer_iteration_second')
 
-      def evoformer_fn(x):
-        act, safe_key = x
-        safe_key, safe_subkey = safe_key.split()
-        evoformer_output = evoformer_iteration(
-            activations=act,
-            masks=evoformer_masks,
-            is_training=is_training,
-            safe_key=safe_subkey)
-        return (evoformer_output, safe_key)
+      # Carry now includes masks so the second-half stack can be vmapped
+      # over a cluster axis where each cluster has its own MSA mask.
+      def _make_evoformer_fn(iteration_module):
+        def evoformer_fn(carry):
+          (act, masks), safe_key = carry
+          safe_key, safe_subkey = safe_key.split()
+          evoformer_output = iteration_module(
+              activations=act,
+              masks=masks,
+              is_training=is_training,
+              safe_key=safe_subkey)
+          return ((evoformer_output, masks), safe_key)
+        if gc.use_remat:
+          evoformer_fn = hk.remat(evoformer_fn)
+        return evoformer_fn
 
-      if gc.use_remat:
-        evoformer_fn = hk.remat(evoformer_fn)
+      evoformer_fn_first = _make_evoformer_fn(evoformer_iteration_first)
+      evoformer_fn_second = _make_evoformer_fn(evoformer_iteration_second)
 
-      evoformer_stack = layer_stack.layer_stack(c.evoformer_num_block)(
-          evoformer_fn)
-      evoformer_output, safe_key = evoformer_stack(
-          (evoformer_input, safe_key))
+      # CSD configuration — propagated through ``c.codec`` if set, otherwise
+      # disabled.  ``csd_block_idx`` is the index of the last block in the
+      # first half (i.e. CSD happens between block csd_block_idx and
+      # csd_block_idx + 1).  openfold2 uses 11.
+      codec_cfg = getattr(c, 'codec', None)
+      codec_enabled = bool(getattr(codec_cfg, 'enabled', False)) if codec_cfg is not None else False
+      csd_block_idx = int(getattr(codec_cfg, 'block_idx', 11)) if codec_cfg is not None else 11
+      n_first_blocks = csd_block_idx + 1
+      n_second_blocks = c.evoformer_num_block - n_first_blocks
+      assert n_second_blocks > 0, (
+          f'csd_block_idx={csd_block_idx} leaves no second-half blocks '
+          f'(evoformer_num_block={c.evoformer_num_block}).'
+      )
 
-      msa_activations = evoformer_output['msa']
-      pair_activations = evoformer_output['pair']
+      # layer_stack itself does not need to contribute to the param path —
+      # the inner Module's stored path already encodes _first / _second.
+      first_stack = layer_stack.layer_stack(n_first_blocks)(evoformer_fn_first)
+      second_stack = layer_stack.layer_stack(n_second_blocks)(evoformer_fn_second)
 
-      single_activations = common_modules.Linear(
-          c.seq_channel, name='single_activations')(
-              msa_activations[0])
+      # ---- First half: blocks 0 .. csd_block_idx with the full MSA ----
+      ((evoformer_mid, _), safe_key) = first_stack(
+          ((evoformer_input, evoformer_masks), safe_key))
 
-    num_sequences = batch['msa_feat'].shape[0]
-    output = {
-        'single': single_activations,
-        'pair': pair_activations,
-        # Crop away template rows such that they are not used in MaskedMsaHead.
-        'msa': msa_activations[:num_sequences, :, :],
-        'msa_first_row': msa_activations[0],
-    }
+      if codec_enabled:
+        # ---- CSD: ship the post-block-11 MSA representation to host via
+        # jax.pure_callback, which trains the on-the-fly CNN projector on
+        # sequence-wise pair fingerprints, clusters the resulting latent
+        # vectors with cosine k-means, and returns fixed-shape gather
+        # indices.  Padding slots reference index 0 and are zeroed out by
+        # seq_mask so they do not contribute downstream. ----
+        n_clusters_static = int(codec_cfg.n_clusters)
+        max_size_static = int(codec_cfg.max_size)
+        host_cluster_fn = codec_cfg.host_cluster_fn  # Python callable
+
+        m_mid = evoformer_mid['msa']    # [N_seq(+templ), L, c_m]
+        z_mid = evoformer_mid['pair']   # [L, L, c_z]
+
+        # pure_callback runs on host: trains the projector on the actual
+        # MSA representation (not raw one-hot), produces sequence-wise
+        # latent vectors and clusters them.  Output shapes are fixed so
+        # XLA can compile through.  We cast m_mid to f32 to make the host
+        # side numerics stable independent of the Evoformer dtype.
+        seq_idx, seq_mask = jax.pure_callback(
+            host_cluster_fn,
+            (
+                jax.ShapeDtypeStruct(
+                    (n_clusters_static, max_size_static), jnp.int32),
+                jax.ShapeDtypeStruct(
+                    (n_clusters_static, max_size_static), jnp.float32),
+            ),
+            m_mid.astype(jnp.float32),
+        )
+        n_clusters_dyn = n_clusters_static
+        seq_mask_d = seq_mask.astype(dtype)
+
+        # Gather m by cluster.  Padding slots reference index 0 and are
+        # zeroed by seq_mask so they don't contribute through attention.
+        m_batched = m_mid[seq_idx] * seq_mask_d[..., None, None]   # [nC, max_sz, L, c_m]
+
+        # Per-cluster msa mask combines the original msa_mask with the
+        # padding mask of the cluster gather.
+        msa_mask_full = evoformer_masks['msa']                      # [N_seq(+templ), L]
+        msa_mask_batched = msa_mask_full[seq_idx] * seq_mask_d[..., None]  # [nC, max_sz, L]
+
+        # Pair representation is shared across clusters — broadcast to the
+        # cluster axis so vmap sees a leading batch dim.
+        z_batched = jnp.broadcast_to(
+            z_mid[None], (n_clusters_dyn,) + z_mid.shape)
+
+        pair_mask_one = evoformer_masks['pair']                     # [L, L]
+        pair_mask_batched = jnp.broadcast_to(
+            pair_mask_one[None], (n_clusters_dyn,) + pair_mask_one.shape)
+
+        # Split the RNG so each cluster gets its own key under vmap.
+        # ``safe_key.get()`` marks the key as used; nothing downstream of
+        # this branch consumes ``safe_key`` again (we return ``output``
+        # directly), so we just discard it.
+        key_raw = safe_key.get()
+        cluster_keys = jax.random.split(key_raw, n_clusters_dyn)
+
+        def _second_half_per_cluster(m_c, z_c, msa_mask_c, pair_mask_c, key_c):
+          act_c = {'msa': m_c, 'pair': z_c}
+          masks_c = {'msa': msa_mask_c, 'pair': pair_mask_c}
+          ((out_c, _), _) = second_stack(
+              ((act_c, masks_c), prng.SafeKey(key_c)))
+          return out_c
+
+        evoformer_batched = jax.vmap(_second_half_per_cluster)(
+            m_batched, z_batched, msa_mask_batched, pair_mask_batched, cluster_keys
+        )
+
+        msa_activations = evoformer_batched['msa']   # [nC, max_sz, L, c_m]
+        pair_activations = evoformer_batched['pair']  # [nC, L, L, c_z]
+
+        # Single projection per cluster — params shared across clusters via
+        # vmap, taking the cluster's slot-0 row of MSA.
+        single_module = common_modules.Linear(
+            c.seq_channel, name='single_activations')
+        single_activations = jax.vmap(single_module)(
+            msa_activations[:, 0, :, :])
+
+        # For MaskedMsaHead etc. we provide the cluster-batched MSA and
+        # first row; downstream heads are disabled by BioEmu via weight=0
+        # so these are not actually read at apply time.
+        num_sequences = batch['msa_feat'].shape[0]
+        output = {
+            'single': single_activations,
+            'pair': pair_activations,
+            'msa': msa_activations[:, :num_sequences, :, :],
+            'msa_first_row': msa_activations[:, 0, :, :],
+        }
+      else:
+        # ---- CSD disabled — chain second half directly on the mid state.
+        # Mathematically equivalent to the original single 48-block stack. ----
+        ((evoformer_output, _), safe_key) = second_stack(
+            ((evoformer_mid, evoformer_masks), safe_key))
+
+        msa_activations = evoformer_output['msa']
+        pair_activations = evoformer_output['pair']
+
+        single_activations = common_modules.Linear(
+            c.seq_channel, name='single_activations')(
+                msa_activations[0])
+
+        num_sequences = batch['msa_feat'].shape[0]
+        output = {
+            'single': single_activations,
+            'pair': pair_activations,
+            # Crop away template rows such that they are not used in MaskedMsaHead.
+            'msa': msa_activations[:num_sequences, :, :],
+            'msa_first_row': msa_activations[0],
+        }
+
     # Convert back to float32 if we're not saving memory.
     if not gc.bfloat16_output:
       for k, v in output.items():

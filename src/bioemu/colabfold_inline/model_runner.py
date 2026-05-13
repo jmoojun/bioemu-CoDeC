@@ -42,11 +42,22 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+# IMPORTANT: load JAX before the vendored AlphaFold (which transitively
+# imports tensorflow inside its data pipeline).  Both JAX and TF ship their
+# own copies of ``xla/xla_data.proto`` — whichever registers first wins, and
+# the second one's duplicate is silently dropped.  But if TF registers
+# first and JAX tries to do so during a *later* dlopen, protobuf's C++
+# descriptor pool aborts the process with
+#   F0000 descriptor.cc:2519] Check failed: GeneratedDatabase()->Add(...)
+#   File already exists in database: xla/xla_data.proto
+# The old code happened to load JAX first via csd_module (which used flax/
+# optax/jax); after the PyTorch rewrite csd_module no longer imports JAX,
+# so we anchor the load order explicitly here.
+import jax  # noqa: F401  -- ordering guard, used inside alphafold below
 import numpy as np
 import requests
 from tqdm import tqdm
 
-from bioemu.colabfold_inline.csd_module import build_cluster_a3m, compute_codec_clusters
 from bioemu.colabfold_inline.features import FeatureDict, build_monomer_feature
 
 logger = logging.getLogger(__name__)
@@ -110,10 +121,66 @@ def _count_a3m_sequences(a3m_string: str) -> int:
     return sum(1 for line in a3m_string.splitlines() if line.startswith(">"))
 
 
+def _split_evoformer_iteration_params(params: dict, n_first: int) -> dict:
+    """Split the stacked ``evoformer_iteration`` params into ``_first``/``_second``.
+
+    The AF2 checkpoint stores each Evoformer-block weight tensor with a leading
+    axis of size ``evoformer_num_block`` (48 for monomer model_3).  The
+    refactored ``EmbeddingsAndEvoformer`` (see ``_vendor/alphafold/model/
+    modules.py``) replaces the single 48-block ``layer_stack`` with two
+    named ``layer_stack``s — ``evoformer_iteration_first`` (size ``n_first``)
+    and ``evoformer_iteration_second`` (size ``48 - n_first``) — so that the
+    CSDModule can be inserted between them.  This function slices the
+    pretrained stack along axis 0 and copies the slices into the two new
+    haiku param namespaces.  The original ``evoformer_iteration/*`` keys are
+    dropped to avoid surprising haiku's strict param-tree checks.
+    """
+    new_params = {}
+    moved_keys = []
+    for module_path, leaves in params.items():
+        if "/evoformer_iteration" not in module_path:
+            new_params[module_path] = leaves
+            continue
+
+        first_path = module_path.replace("/evoformer_iteration", "/evoformer_iteration_first", 1)
+        second_path = module_path.replace("/evoformer_iteration", "/evoformer_iteration_second", 1)
+
+        sliced_first = {}
+        sliced_second = {}
+        for leaf_name, value in leaves.items():
+            if value.shape[0] != n_first + (value.shape[0] - n_first):
+                # Should never happen — sanity check.
+                raise ValueError(
+                    f"Unexpected leading axis for {module_path}/{leaf_name}: " f"{value.shape}."
+                )
+            sliced_first[leaf_name] = value[:n_first]
+            sliced_second[leaf_name] = value[n_first:]
+
+        new_params[first_path] = sliced_first
+        new_params[second_path] = sliced_second
+        moved_keys.append(module_path)
+
+    if moved_keys:
+        logger.info(
+            "CoDeC: split %d evoformer_iteration param modules into _first(%d) + _second(%d).",
+            len(moved_keys),
+            n_first,
+            next(iter(new_params.values()))[next(iter(next(iter(new_params.values()))))].shape[0]
+            if False
+            else 0,
+        )
+    return new_params
+
+
 def _load_model_and_params(
     data_dir: Path = DEFAULT_PARAMS_DIR,
     max_msa_clusters: int | None = None,
     max_extra_msa: int | None = None,
+    csd_n_clusters: int | None = None,
+    csd_max_size: int = 128,
+    csd_block_idx: int = 11,
+    csd_rng_seed: int = 0,
+    csd_host_cluster_fn: Any = None,
 ) -> tuple[Any, Any]:
     """Load model_3 runner and its parameters.
 
@@ -142,11 +209,29 @@ def _load_model_and_params(
     model_config.model.num_recycle = NUM_RECYCLE
     model_config.data.eval.num_ensemble = NUM_ENSEMBLE
 
+    # Refactor pretrained evoformer params into the (first, second) split that
+    # our patched Evoformer expects, so CSD can sit between them.  Even when
+    # CSD is disabled, both stacks are present in the haiku model and need
+    # their respective param slices.
+    n_first_blocks = int(csd_block_idx) + 1
+    params = _split_evoformer_iteration_params(params, n_first=n_first_blocks)
+
     # CoDeC config (openfold2): use the full MSA — no AF2-level subsampling.
     if max_msa_clusters is not None:
         model_config.data.eval.max_msa_clusters = int(max_msa_clusters)
     if max_extra_msa is not None:
         model_config.data.common.max_extra_msa = int(max_extra_msa)
+
+    # Disable bfloat16 inside the Evoformer.  The vendored ColabFold AF2
+    # config sets ``model.global_config.bfloat16=True`` for memory.  On the
+    # jax-cuda12 plugin pinned by bioemu (0.4.35), XLA inserts bf16->f16
+    # casts somewhere in the Evoformer graph (likely between bf16 internals
+    # and f16 representation slots) that the plugin can't lower, yielding
+    # ``LLVM ERROR: Unsupported rounding mode for conversion``.  Forcing
+    # the whole stack to f32 sidesteps every bf16<->f16 boundary at the
+    # cost of more memory.
+    model_config.model.global_config.bfloat16 = False
+    model_config.model.global_config.bfloat16_output = False
 
     # Disable unused heads to save compute — we only need representations_evo
     model_config.model.heads.distogram.weight = 0.0
@@ -160,10 +245,29 @@ def _load_model_and_params(
     evo.triangle_multiplication_incoming.fuse_projection_weights = True
     evo.triangle_multiplication_outgoing.fuse_projection_weights = True
 
+    # CoDeC sub-config consumed by the patched ``EmbeddingsAndEvoformer``.
+    # When ``enabled=True`` the Evoformer splits after block ``block_idx``,
+    # clusters the post-block-11 MSA via the host callback, gathers m by
+    # cluster, and vmaps the remaining blocks over the cluster axis.
+    import ml_collections
+
+    eae = model_config.model.embeddings_and_evoformer
+    eae.codec = ml_collections.ConfigDict()
+    eae.codec.enabled = bool(csd_n_clusters is not None and csd_n_clusters > 1)
+    eae.codec.n_clusters = int(csd_n_clusters) if csd_n_clusters else 1
+    eae.codec.max_size = int(csd_max_size)
+    eae.codec.block_idx = int(csd_block_idx)
+    eae.codec.rng_seed = int(csd_rng_seed)
+    eae.codec.host_cluster_fn = csd_host_cluster_fn
+
     logger.info(
-        "AF2 config: max_msa_clusters=%d, max_extra_msa=%d",
+        "AF2 config: max_msa_clusters=%d, max_extra_msa=%d | CSD enabled=%s n_clusters=%d max_size=%d block_idx=%d",
         model_config.data.eval.max_msa_clusters,
         model_config.data.common.max_extra_msa,
+        eae.codec.enabled,
+        eae.codec.n_clusters,
+        eae.codec.max_size,
+        eae.codec.block_idx,
     )
 
     model_runner = model.RunModel(model_config, params)
@@ -258,6 +362,22 @@ def _run_model(
         input_features = _pad_input(input_features, model_runner, pad_len)
         logger.info(f"Padded input to {pad_len} residues")
 
+    # Workaround: jax-cuda12 plugin 0.4.35 (the version bioemu pins via
+    # pyproject) can't lower ``bf16 -> f16`` rounding casts that XLA inserts
+    # when ColabFold's patched AlphaFold passes f16 recycling buffers
+    # (``prev_msa_first_row``, ``prev_pair``, ``prev_pos``) into the
+    # bf16 Evoformer.  Cast every f16 entry up to f32 here so the whole
+    # apply_fn graph stays in f32 and the broken cast disappears.
+    # Symptom without this: ``LLVM ERROR: Unsupported rounding mode for
+    # conversion. Aborted (core dumped)`` at apply_fn JIT compile time.
+    n_cast = 0
+    for k, v in list(input_features.items()):
+        if hasattr(v, "dtype") and v.dtype == np.float16:
+            input_features[k] = v.astype(np.float32)
+            n_cast += 1
+    if n_cast:
+        logger.info("Cast %d float16 features to float32 (XLA bf16->f16 workaround).", n_cast)
+
     # Run prediction with representations
     result, _recycles = model_runner.predict(
         input_features,
@@ -265,12 +385,24 @@ def _run_model(
         return_representations=True,
     )
 
-    # Extract Evoformer representations (before structure module, via patch)
+    # Extract Evoformer representations (before structure module, via patch).
     # representations_evo has the 384-dim single and 128-dim pair embeddings
     # that BioEmu uses, as opposed to the post-structure-module representations.
+    #
+    # With CSD enabled the patched ``EmbeddingsAndEvoformer`` returns these
+    # with a leading cluster axis ([nC, L, 384] / [nC, L, L, 128]).  Without
+    # CSD the shapes are the original [L, 384] / [L, L, 128]; we prepend a
+    # singleton batch axis in that case for a uniform downstream contract.
     evo_repr = result["representations_evo"]
-    single_repr = np.array(evo_repr["single"][:seq_len])
-    pair_repr = np.array(evo_repr["pair"][:seq_len, :seq_len])
+    single_arr = np.array(evo_repr["single"])
+    pair_arr = np.array(evo_repr["pair"])
+    if single_arr.ndim == 2:
+        single_repr = single_arr[:seq_len][None, ...]  # [1, L, 384]
+        pair_repr = pair_arr[:seq_len, :seq_len][None, ...]  # [1, L, L, 128]
+    else:
+        # CSD-batched
+        single_repr = single_arr[:, :seq_len]  # [nC, L, 384]
+        pair_repr = pair_arr[:, :seq_len, :seq_len]  # [nC, L, L, 128]
 
     return {"single": single_repr, "pair": pair_repr}
 
@@ -298,97 +430,85 @@ def get_embeddings(
     data_dir: str | Path = DEFAULT_PARAMS_DIR,
     random_seed: int = 0,
     n_clusters: int = DEFAULT_NUM_CLUSTERS,
+    max_size: int = 128,
+    csd_block_idx: int = 11,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run the AF2 Evoformer and return single + pair representations.
+    """Run the AF2 Evoformer with in-graph CoDeC and return batched embeddings.
 
-    This is the main entry point for BioEmu embedding generation.  It builds
-    features from the sequence and MSA, loads the AF2 model (downloading weights
-    if necessary), runs the forward pass, and returns the Evoformer embeddings.
-
-    With CoDeC enabled (``n_clusters > 1``), the MSA is first decomposed into
-    ``n_clusters`` coevolutionary clusters; AF2 is run once per cluster and
-    the resulting embeddings are stacked along a leading batch dimension.
-    BioEmu then samples sequentially across this batch dimension.
+    Single forward pass through AF2.  The patched ``EmbeddingsAndEvoformer``
+    splits the 48 Evoformer blocks at ``csd_block_idx`` (default 11): the
+    first ``csd_block_idx + 1`` blocks run with the full MSA, then a host
+    callback (``cluster_m_act_to_indices``) trains the on-the-fly CNN
+    projector on the post-block MSA representation, clusters the resulting
+    latent vectors via cosine k-means, and returns fixed-shape gather
+    indices.  The MSA is then reshaped to ``[n_clusters, max_size, L, c_m]``
+    (padded slots zeroed via the mask), the pair representation is
+    broadcast across the cluster axis, and the remaining 36 blocks run
+    under ``jax.vmap`` — one cluster per batch element.  The single
+    projection is applied per cluster, yielding the multistate ensemble
+    that BioEmu samples sequentially over.
 
     Args:
         sequence: Protein sequence (uppercase single-letter amino acids).
         a3m_string: MSA in A3M format (query sequence first).
         data_dir: Directory containing (or to download) AF2 model weights.
-        random_seed: Random seed for the model.
+        random_seed: Random seed for the model + CSD k-means + projector init.
         n_clusters: Number of CoDeC clusters / states to produce.  Set to ``1``
-            to disable CoDeC and fall back to a single AF2 pass.
+            to disable CoDeC (the second stack still runs but in single-state
+            mode); the output then has a leading dim of 1.
+        max_size: Maximum sequences per cluster after padding (openfold2 uses
+            128 — capping memory of the batched second half).
+        csd_block_idx: Index of the last Evoformer block in the first half
+            (i.e. CSD happens between this block and the next).  openfold2
+            uses 11 ⇒ first half of 12 blocks, second half of 36 blocks.
 
     Returns:
         ``(single_repr, pair_repr)`` where:
-        - ``single_repr`` has shape ``(B, L, 384)``
-        - ``pair_repr`` has shape ``(B, L, L, 128)``
-        and ``B == n_clusters`` (or fewer if the MSA is too shallow for
-        ``n_clusters`` distinct clusters).
+        - ``single_repr`` has shape ``(n_clusters, L, 384)``
+        - ``pair_repr`` has shape ``(n_clusters, L, L, 128)``
     """
     data_dir = Path(data_dir)
 
-    # Build features for the full MSA to size things and get the deduped int MSA
-    # used as the basis for CoDeC clustering.
     feature_dict = build_monomer_feature(sequence, a3m_string)
 
-    # Following the openfold2 CoDeC config: AF2 sees the full MSA (no
-    # subsampling).  Count the number of A3M sequences and pass that as
-    # max_msa_clusters / max_extra_msa.
+    # openfold2 CoDeC config: AF2 sees the full MSA — no AF2-level subsampling.
     num_seqs = _count_a3m_sequences(a3m_string)
     logger.info("CoDeC: A3M contains %d sequences (used for max_msa_clusters).", num_seqs)
+
+    # Host-side cluster-and-index callback for jax.pure_callback inside the
+    # Evoformer.  Bind ``n_clusters`` and ``max_size`` here so the output
+    # shape is static at JIT trace time.
+    import functools
+
+    from bioemu.colabfold_inline.csd_module import cluster_m_act_to_indices
+
+    host_cluster_fn = functools.partial(
+        cluster_m_act_to_indices,
+        n_clusters=int(n_clusters),
+        max_size=int(max_size),
+        rng_seed=int(random_seed),
+    )
+
     model_runner, _params = _load_model_and_params(
         data_dir,
         max_msa_clusters=num_seqs,
         max_extra_msa=num_seqs,
+        csd_n_clusters=int(n_clusters),
+        csd_max_size=int(max_size),
+        csd_block_idx=int(csd_block_idx),
+        csd_rng_seed=int(random_seed),
+        csd_host_cluster_fn=host_cluster_fn,
     )
 
-    # Compute padding length (round up to next multiple of 16)
     seq_len = len(sequence)
     pad_len = int(np.ceil(seq_len / 16) * 16)
 
-    if n_clusters is None or n_clusters <= 1:
-        # CoDeC disabled — single forward pass, but still return a batch dim
-        # of size 1 so downstream code can assume a uniform contract.
-        representations = _run_model(feature_dict, model_runner, pad_len, random_seed)
-        single_repr = representations["single"][None, ...]
-        pair_repr = representations["pair"][None, ...]
-        logger.info(
-            f"Embeddings computed (no CoDeC): single={single_repr.shape}, pair={pair_repr.shape}"
-        )
-        return single_repr, pair_repr
-
-    # CoDeC: cluster MSA sequences by their coevolutionary fingerprint.
-    msa_int = feature_dict["msa"]  # [N_seq, N_res], integer-encoded deduped MSA
-    cluster_idxs = compute_codec_clusters(
-        msa_int=msa_int,
-        n_clusters=n_clusters,
-        rng_seed=random_seed,
+    representations = _run_model(feature_dict, model_runner, pad_len, random_seed)
+    single_repr = representations["single"]  # already [B, L, 384]
+    pair_repr = representations["pair"]  # already [B, L, L, 128]
+    logger.info(
+        "CoDeC embeddings computed: single=%s, pair=%s",
+        single_repr.shape,
+        pair_repr.shape,
     )
-    unique_clusters = np.unique(cluster_idxs)
-    actual_k = int(unique_clusters.size)
-    logger.info("CoDeC produced %d non-empty clusters (requested %d).", actual_k, n_clusters)
-
-    single_batch = []
-    pair_batch = []
-    for cid in unique_clusters:
-        cluster_a3m = build_cluster_a3m(a3m_string, cluster_idxs, int(cid))
-        logger.info(
-            "Running AF2 on cluster %d/%d (%d-line A3M).",
-            int(cid),
-            actual_k,
-            cluster_a3m.count("\n"),
-        )
-        representations = _run_one_state(
-            sequence,
-            cluster_a3m,
-            model_runner,
-            pad_len,
-            random_seed,
-        )
-        single_batch.append(representations["single"])
-        pair_batch.append(representations["pair"])
-
-    single_repr = np.stack(single_batch, axis=0)  # [B, L, 384]
-    pair_repr = np.stack(pair_batch, axis=0)  # [B, L, L, 128]
-    logger.info(f"CoDeC embeddings computed: single={single_repr.shape}, pair={pair_repr.shape}")
     return single_repr, pair_repr
