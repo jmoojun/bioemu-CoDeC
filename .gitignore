@@ -1,3 +1,8 @@
+log/
+test/
+run_codec_6e9n_1.sh
+run.sh
+
 # Vim swap files
 *.swp
 

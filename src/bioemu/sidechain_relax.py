@@ -295,17 +295,18 @@ def main(
     samples_all_heavy = reconstruct_sidechains(samples)
 
     # write out sidechain reconstructed output
-    samples_all_heavy.save_xtc(os.path.join(outpath, f"{prefix}_sidechain_rec.xtc"))
-    samples_all_heavy[0].save_pdb(os.path.join(outpath, f"{prefix}_sidechain_rec.pdb"))
+    outpath_new = os.path.dirname(xtc_path)
+    samples_all_heavy.save_xtc(os.path.join(outpath_new, f"{prefix}_sidechain_rec.xtc"))
+    samples_all_heavy[0].save_pdb(os.path.join(outpath_new, f"{prefix}_sidechain_rec.pdb"))
 
     # run MD equilibration if requested
     if md_equil:
         samples_equil = run_all_md(
-            samples_all_heavy, md_protocol, simtime_ns=simtime_ns, outpath=outpath
+            samples_all_heavy, md_protocol, simtime_ns=simtime_ns, outpath=outpath_new
         )
 
-        samples_equil.save_xtc(os.path.join(outpath, f"{prefix}_md_equil.xtc"))
-        samples_equil[0].save_pdb(os.path.join(outpath, f"{prefix}_md_equil.pdb"))
+        samples_equil.save_xtc(os.path.join(outpath_new, f"{prefix}_md_equil.xtc"))
+        samples_equil[0].save_pdb(os.path.join(outpath_new, f"{prefix}_md_equil.pdb"))
 
     if verbose:
         logger.setLevel(original_loglevel)

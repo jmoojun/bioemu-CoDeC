@@ -20,10 +20,18 @@ and pair representations that BioEmu consumes.  JAX, Haiku, and the ``alphafold`
 package are **optional dependencies** — they are only imported when this module
 is actually used.
 
+When CoDeC (Coevolutionary Decomposition and Clustering, Jun et al., 2026)
+is enabled, the MSA is first clustered into ``n_clusters`` groups whose
+sequences share similar residue-residue couplings.  AF2 is then run once
+per cluster (with that cluster's MSA), and the resulting single/pair
+representations are stacked along a leading batch dimension, giving a
+multistate ensemble that BioEmu can sample over sequentially.
+
 Typical usage::
 
     from bioemu.colabfold_inline.model_runner import get_embeddings
     single_repr, pair_repr = get_embeddings(sequence, a3m_string)
+    # single_repr: [B, L, 384], pair_repr: [B, L, L, 128] where B = n_clusters
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ import numpy as np
 import requests
 from tqdm import tqdm
 
+from bioemu.colabfold_inline.csd_module import build_cluster_a3m, compute_codec_clusters
 from bioemu.colabfold_inline.features import FeatureDict, build_monomer_feature
 
 logger = logging.getLogger(__name__)
@@ -50,6 +59,9 @@ MODEL_TYPE = "alphafold2"
 MODEL_NUMBER = 3
 NUM_RECYCLE = 0
 NUM_ENSEMBLE = 1
+
+# Default number of CoDeC clusters → produces a multistate ensemble of this size.
+DEFAULT_NUM_CLUSTERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +105,23 @@ def download_alphafold_params(data_dir: Path = DEFAULT_PARAMS_DIR) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _count_a3m_sequences(a3m_string: str) -> int:
+    """Count the number of sequences in an A3M string (``>``-prefixed headers)."""
+    return sum(1 for line in a3m_string.splitlines() if line.startswith(">"))
+
+
 def _load_model_and_params(
     data_dir: Path = DEFAULT_PARAMS_DIR,
+    max_msa_clusters: int | None = None,
+    max_extra_msa: int | None = None,
 ) -> tuple[Any, Any]:
     """Load model_3 runner and its parameters.
+
+    Following the openfold2 CoDeC config (``openfold/config.py``), both
+    ``max_msa_clusters`` and ``max_extra_msa`` are set to the *total*
+    number of sequences in the input A3M so that AF2 does not subsample
+    the MSA before the CSDModule sees it.  Pass ``max_msa_clusters`` and
+    ``max_extra_msa`` to override.
 
     Returns ``(model_runner, params)`` — both are JAX/Haiku objects.
     """
@@ -116,6 +141,13 @@ def _load_model_and_params(
     model_config.data.common.num_recycle = NUM_RECYCLE
     model_config.model.num_recycle = NUM_RECYCLE
     model_config.data.eval.num_ensemble = NUM_ENSEMBLE
+
+    # CoDeC config (openfold2): use the full MSA — no AF2-level subsampling.
+    if max_msa_clusters is not None:
+        model_config.data.eval.max_msa_clusters = int(max_msa_clusters)
+    if max_extra_msa is not None:
+        model_config.data.common.max_extra_msa = int(max_extra_msa)
+
     # Disable unused heads to save compute — we only need representations_evo
     model_config.model.heads.distogram.weight = 0.0
     model_config.model.heads.masked_msa.weight = 0.0
@@ -127,6 +159,12 @@ def _load_model_and_params(
     evo = model_config.model.embeddings_and_evoformer.evoformer
     evo.triangle_multiplication_incoming.fuse_projection_weights = True
     evo.triangle_multiplication_outgoing.fuse_projection_weights = True
+
+    logger.info(
+        "AF2 config: max_msa_clusters=%d, max_extra_msa=%d",
+        model_config.data.eval.max_msa_clusters,
+        model_config.data.common.max_extra_msa,
+    )
 
     model_runner = model.RunModel(model_config, params)
     return model_runner, params
@@ -242,11 +280,24 @@ def _run_model(
 # ---------------------------------------------------------------------------
 
 
+def _run_one_state(
+    sequence: str,
+    a3m_string: str,
+    model_runner: Any,
+    pad_len: int,
+    random_seed: int,
+) -> dict[str, np.ndarray]:
+    """Build features for ``a3m_string`` and run a single AF2 forward pass."""
+    feature_dict = build_monomer_feature(sequence, a3m_string)
+    return _run_model(feature_dict, model_runner, pad_len, random_seed)
+
+
 def get_embeddings(
     sequence: str,
     a3m_string: str,
     data_dir: str | Path = DEFAULT_PARAMS_DIR,
     random_seed: int = 0,
+    n_clusters: int = DEFAULT_NUM_CLUSTERS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the AF2 Evoformer and return single + pair representations.
 
@@ -254,34 +305,90 @@ def get_embeddings(
     features from the sequence and MSA, loads the AF2 model (downloading weights
     if necessary), runs the forward pass, and returns the Evoformer embeddings.
 
+    With CoDeC enabled (``n_clusters > 1``), the MSA is first decomposed into
+    ``n_clusters`` coevolutionary clusters; AF2 is run once per cluster and
+    the resulting embeddings are stacked along a leading batch dimension.
+    BioEmu then samples sequentially across this batch dimension.
+
     Args:
         sequence: Protein sequence (uppercase single-letter amino acids).
         a3m_string: MSA in A3M format (query sequence first).
         data_dir: Directory containing (or to download) AF2 model weights.
         random_seed: Random seed for the model.
+        n_clusters: Number of CoDeC clusters / states to produce.  Set to ``1``
+            to disable CoDeC and fall back to a single AF2 pass.
 
     Returns:
         ``(single_repr, pair_repr)`` where:
-        - ``single_repr`` has shape ``(L, 384)``
-        - ``pair_repr`` has shape ``(L, L, 128)``
+        - ``single_repr`` has shape ``(B, L, 384)``
+        - ``pair_repr`` has shape ``(B, L, L, 128)``
+        and ``B == n_clusters`` (or fewer if the MSA is too shallow for
+        ``n_clusters`` distinct clusters).
     """
     data_dir = Path(data_dir)
 
-    # Build features
+    # Build features for the full MSA to size things and get the deduped int MSA
+    # used as the basis for CoDeC clustering.
     feature_dict = build_monomer_feature(sequence, a3m_string)
 
-    # Load model
-    model_runner, _params = _load_model_and_params(data_dir)
+    # Following the openfold2 CoDeC config: AF2 sees the full MSA (no
+    # subsampling).  Count the number of A3M sequences and pass that as
+    # max_msa_clusters / max_extra_msa.
+    num_seqs = _count_a3m_sequences(a3m_string)
+    logger.info("CoDeC: A3M contains %d sequences (used for max_msa_clusters).", num_seqs)
+    model_runner, _params = _load_model_and_params(
+        data_dir,
+        max_msa_clusters=num_seqs,
+        max_extra_msa=num_seqs,
+    )
 
     # Compute padding length (round up to next multiple of 16)
     seq_len = len(sequence)
     pad_len = int(np.ceil(seq_len / 16) * 16)
 
-    # Run forward pass
-    representations = _run_model(feature_dict, model_runner, pad_len, random_seed)
+    if n_clusters is None or n_clusters <= 1:
+        # CoDeC disabled — single forward pass, but still return a batch dim
+        # of size 1 so downstream code can assume a uniform contract.
+        representations = _run_model(feature_dict, model_runner, pad_len, random_seed)
+        single_repr = representations["single"][None, ...]
+        pair_repr = representations["pair"][None, ...]
+        logger.info(
+            f"Embeddings computed (no CoDeC): single={single_repr.shape}, pair={pair_repr.shape}"
+        )
+        return single_repr, pair_repr
 
-    single_repr = representations["single"]
-    pair_repr = representations["pair"]
+    # CoDeC: cluster MSA sequences by their coevolutionary fingerprint.
+    msa_int = feature_dict["msa"]  # [N_seq, N_res], integer-encoded deduped MSA
+    cluster_idxs = compute_codec_clusters(
+        msa_int=msa_int,
+        n_clusters=n_clusters,
+        rng_seed=random_seed,
+    )
+    unique_clusters = np.unique(cluster_idxs)
+    actual_k = int(unique_clusters.size)
+    logger.info("CoDeC produced %d non-empty clusters (requested %d).", actual_k, n_clusters)
 
-    logger.info(f"Embeddings computed: single={single_repr.shape}, pair={pair_repr.shape}")
+    single_batch = []
+    pair_batch = []
+    for cid in unique_clusters:
+        cluster_a3m = build_cluster_a3m(a3m_string, cluster_idxs, int(cid))
+        logger.info(
+            "Running AF2 on cluster %d/%d (%d-line A3M).",
+            int(cid),
+            actual_k,
+            cluster_a3m.count("\n"),
+        )
+        representations = _run_one_state(
+            sequence,
+            cluster_a3m,
+            model_runner,
+            pad_len,
+            random_seed,
+        )
+        single_batch.append(representations["single"])
+        pair_batch.append(representations["pair"])
+
+    single_repr = np.stack(single_batch, axis=0)  # [B, L, 384]
+    pair_repr = np.stack(pair_batch, axis=0)  # [B, L, L, 128]
+    logger.info(f"CoDeC embeddings computed: single={single_repr.shape}, pair={pair_repr.shape}")
     return single_repr, pair_repr

@@ -87,12 +87,18 @@ def get_colabfold_embeds(
     cache_embeds_dir: StrPath | None,
     msa_file: StrPath | None = None,
     msa_host_url: str | None = None,
+    n_clusters: int = 4,
 ) -> tuple[StrPath, StrPath]:
-    """Compute Evoformer embeddings for a protein sequence.
+    """Compute (multistate) Evoformer embeddings for a protein sequence.
 
     Checks a local cache first; if embeddings are not cached, obtains an MSA
     (from a provided A3M file or from the MMseqs2 server) and runs the
     AlphaFold2 Evoformer forward pass via the inlined pipeline.
+
+    With CoDeC enabled (default ``n_clusters=4``) the cached arrays carry a
+    leading batch dimension equal to the number of clusters actually
+    produced; the consumer is responsible for iterating across that
+    dimension when sampling.
 
     Args:
         seq: Protein sequence to query (uppercase single-letter AA).
@@ -101,10 +107,13 @@ def get_colabfold_embeds(
         msa_file: Pre-computed A3M file to use.  If ``None``, the MSA is
             retrieved from the ColabFold MMseqs2 server.
         msa_host_url: Custom MSA server URL.  Ignored when *msa_file* is set.
+        n_clusters: Number of CoDeC clusters to produce.  ``1`` disables
+            CoDeC and stores a single state.
 
     Returns:
         Tuple of paths ``(single_rep_file, pair_rep_file)`` to the cached
-        ``.npy`` files containing the Evoformer representations.
+        ``.npy`` files containing the Evoformer representations.  Each file
+        has a leading batch dimension equal to the number of CoDeC states.
     """
     seqsha = shahexencode(seq)
 
@@ -113,9 +122,11 @@ def get_colabfold_embeds(
     cache_embeds_dir = os.path.expanduser(cache_embeds_dir)
     os.makedirs(cache_embeds_dir, exist_ok=True)
 
-    # Check whether embeds have already been computed
-    single_rep_file = os.path.join(cache_embeds_dir, f"{seqsha}_single.npy")
-    pair_rep_file = os.path.join(cache_embeds_dir, f"{seqsha}_pair.npy")
+    # Cache keys depend on the number of clusters so that a previous
+    # single-state run does not silently shadow a CoDeC run (or vice-versa).
+    suffix = f"_codec{n_clusters}" if n_clusters and n_clusters > 1 else ""
+    single_rep_file = os.path.join(cache_embeds_dir, f"{seqsha}{suffix}_single.npy")
+    pair_rep_file = os.path.join(cache_embeds_dir, f"{seqsha}{suffix}_pair.npy")
 
     if os.path.exists(single_rep_file) and os.path.exists(pair_rep_file):
         logger.info(f"Using cached embeddings in {cache_embeds_dir}.")
@@ -127,9 +138,9 @@ def get_colabfold_embeds(
     # Run AF2 forward pass
     from bioemu.colabfold_inline.model_runner import get_embeddings
 
-    single_repr, pair_repr = get_embeddings(seq, a3m_string)
+    single_repr, pair_repr = get_embeddings(seq, a3m_string, n_clusters=n_clusters)
 
-    # Save to cache
+    # Save to cache (with leading batch dimension).
     np.save(single_rep_file, single_repr)
     np.save(pair_rep_file, pair_repr)
 

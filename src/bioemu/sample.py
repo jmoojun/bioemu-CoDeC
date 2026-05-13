@@ -82,6 +82,7 @@ def main(
     msa_host_url: str | None = None,
     filter_samples: bool = True,
     base_seed: int | None = None,
+    n_clusters: int = 4,
 ) -> None:
     """
     Generate samples for a specified sequence, using a trained model.
@@ -110,6 +111,10 @@ def main(
         msa_host_url: MSA server URL. If not set, this defaults to colabfold's remote server. If sequence is an a3m file, this is ignored.
         filter_samples: Filter out unphysical samples with e.g. long bond distances or steric clashes.
         base_seed: Base random seed for sampling. If set, each batch's seed will be set to base_seed + (num samples already generated).
+        n_clusters: Number of CoDeC clusters / coevolutionary states.  AlphaFold2
+            embeddings are computed once per cluster, and the requested
+            ``batch_size`` samples are distributed (round-robin) across the
+            resulting states.  Set to ``1`` to disable CoDeC.
     """
 
     if base_seed is None:
@@ -205,6 +210,7 @@ def main(
             cache_embeds_dir=cache_embeds_dir,
             msa_file=msa_file,
             msa_host_url=msa_host_url,
+            n_clusters=n_clusters,
         )
 
         batch = {k: v.cpu().numpy() for k, v in batch.items()}
@@ -231,12 +237,20 @@ def main(
     logger.info(f"Completed. Your samples are in {output_dir}.")
 
 
-def get_context_chemgraph(
+def get_context_chemgraphs(
     sequence: str,
     cache_embeds_dir: str | Path | None = None,
     msa_file: str | Path | None = None,
     msa_host_url: str | None = None,
-) -> ChemGraph:
+    n_clusters: int = 4,
+) -> list[ChemGraph]:
+    """Load CoDeC-batched embeddings and return one ChemGraph per state.
+
+    The returned list has length equal to the number of CoDeC clusters that
+    were actually produced (which may be less than ``n_clusters`` if the MSA
+    was too shallow).  BioEmu sampling iterates over this list, generating
+    a separate ensemble of structures for each cluster.
+    """
     n = len(sequence)
 
     single_embeds_file, pair_embeds_file = get_colabfold_embeds(
@@ -244,15 +258,23 @@ def get_context_chemgraph(
         cache_embeds_dir=cache_embeds_dir,
         msa_file=msa_file,
         msa_host_url=msa_host_url,
+        n_clusters=n_clusters,
     )
-    single_embeds = torch.from_numpy(np.load(single_embeds_file))
-    pair_embeds = torch.from_numpy(np.load(pair_embeds_file))
-    assert pair_embeds.shape[0] == pair_embeds.shape[1] == n
-    assert single_embeds.shape[0] == n
-    assert len(single_embeds.shape) == 2
-    _, _, n_pair_feats = pair_embeds.shape  # [seq_len, seq_len, n_pair_feats]
+    single_embeds_batch = torch.from_numpy(np.load(single_embeds_file))  # [B, L, 384]
+    pair_embeds_batch = torch.from_numpy(np.load(pair_embeds_file))  # [B, L, L, 128]
 
-    pair_embeds = pair_embeds.view(n**2, n_pair_feats)
+    # Backwards-compat: older caches were saved without a leading batch dim.
+    if single_embeds_batch.ndim == 2:
+        single_embeds_batch = single_embeds_batch.unsqueeze(0)
+        pair_embeds_batch = pair_embeds_batch.unsqueeze(0)
+
+    assert single_embeds_batch.ndim == 3, single_embeds_batch.shape
+    assert pair_embeds_batch.ndim == 4, pair_embeds_batch.shape
+    assert pair_embeds_batch.shape[1] == pair_embeds_batch.shape[2] == n
+    assert single_embeds_batch.shape[1] == n
+
+    n_states = single_embeds_batch.shape[0]
+    _, _, _, n_pair_feats = pair_embeds_batch.shape
 
     edge_index = torch.cat(
         [
@@ -263,18 +285,43 @@ def get_context_chemgraph(
     )
     pos = torch.full((n, 3), float("nan"))
     node_orientations = torch.full((n, 3, 3), float("nan"))
-
     node_labels = torch.LongTensor([_NODE_LABEL_MAPPING[aa] for aa in sequence])
 
-    return ChemGraph(
-        edge_index=edge_index,
-        pos=pos,
-        node_orientations=node_orientations,
-        single_embeds=single_embeds,
-        pair_embeds=pair_embeds,
+    contexts: list[ChemGraph] = []
+    for state_idx in range(n_states):
+        single_embeds = single_embeds_batch[state_idx]
+        pair_embeds = pair_embeds_batch[state_idx].reshape(n**2, n_pair_feats)
+        contexts.append(
+            ChemGraph(
+                edge_index=edge_index.clone(),
+                pos=pos.clone(),
+                node_orientations=node_orientations.clone(),
+                single_embeds=single_embeds,
+                pair_embeds=pair_embeds,
+                sequence=sequence,
+                node_labels=node_labels.clone(),
+            )
+        )
+    return contexts
+
+
+def get_context_chemgraph(
+    sequence: str,
+    cache_embeds_dir: str | Path | None = None,
+    msa_file: str | Path | None = None,
+    msa_host_url: str | None = None,
+    n_clusters: int = 4,
+    state_idx: int = 0,
+) -> ChemGraph:
+    """Return a single CoDeC state's ChemGraph, selected by ``state_idx``."""
+    contexts = get_context_chemgraphs(
         sequence=sequence,
-        node_labels=node_labels,
+        cache_embeds_dir=cache_embeds_dir,
+        msa_file=msa_file,
+        msa_host_url=msa_host_url,
+        n_clusters=n_clusters,
     )
+    return contexts[state_idx % len(contexts)]
 
 
 def generate_batch(
@@ -287,8 +334,15 @@ def generate_batch(
     cache_embeds_dir: str | Path | None,
     msa_file: str | Path | None = None,
     msa_host_url: str | None = None,
+    n_clusters: int = 4,
 ) -> dict[str, torch.Tensor]:
     """Generate one batch of samples, using GPU if available.
+
+    With CoDeC the embedding has a leading batch (=state) dimension.  We
+    distribute the requested ``batch_size`` samples across the CoDeC states
+    in round-robin, then for each state run the score-based sampler on the
+    subset of samples assigned to that state.  This keeps memory bounded
+    while letting each state contribute to the final ensemble.
 
     Args:
         score_model: Score model.
@@ -301,39 +355,53 @@ def generate_batch(
             potentials and steering_config already bound.
         msa_file: Optional path to an MSA A3M file.
         msa_host_url: MSA server URL for colabfold.
+        n_clusters: Number of CoDeC clusters / states.  ``1`` disables CoDeC.
     """
 
     torch.manual_seed(seed)
 
-    context_chemgraph = get_context_chemgraph(
+    context_chemgraphs = get_context_chemgraphs(
         sequence=sequence,
         cache_embeds_dir=cache_embeds_dir,
         msa_file=msa_file,
         msa_host_url=msa_host_url,
+        n_clusters=n_clusters,
     )
+    n_states = len(context_chemgraphs)
 
-    context_batch = Batch.from_data_list([context_chemgraph] * batch_size)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    result = denoiser(
-        sdes=sdes,
-        device=device,
-        batch=context_batch,
-        score_model=score_model,
-    )
+    # Round-robin assignment of the batch_size samples to states.
+    # Each state gets ceil(batch_size / n_states) samples (the last state may get
+    # fewer).  We then sample sequentially across states.
+    pos_chunks: list[torch.Tensor] = []
+    orient_chunks: list[torch.Tensor] = []
+    base = batch_size // n_states
+    remainder = batch_size - base * n_states
+    for state_idx, context_chemgraph in enumerate(context_chemgraphs):
+        sub_bs = base + (1 if state_idx < remainder else 0)
+        if sub_bs == 0:
+            continue
+        context_batch = Batch.from_data_list([context_chemgraph] * sub_bs)
+        result = denoiser(
+            sdes=sdes,
+            device=device,
+            batch=context_batch,
+            score_model=score_model,
+        )
+        if isinstance(result, tuple):
+            sampled_chemgraph_batch, _ = result
+        else:
+            sampled_chemgraph_batch = result
+        assert isinstance(sampled_chemgraph_batch, Batch)
+        sampled_chemgraphs = sampled_chemgraph_batch.to_data_list()
+        pos_chunks.append(torch.stack([x.pos for x in sampled_chemgraphs]).to("cpu"))
+        orient_chunks.append(
+            torch.stack([x.node_orientations for x in sampled_chemgraphs]).to("cpu")
+        )
 
-    # Steered denoisers (SMC) return (batch, log_weights); unsteered returns batch
-    if isinstance(result, tuple):
-        sampled_chemgraph_batch, _ = result
-    else:
-        sampled_chemgraph_batch = result
-    assert isinstance(sampled_chemgraph_batch, Batch)
-    sampled_chemgraphs = sampled_chemgraph_batch.to_data_list()
-    pos = torch.stack([x.pos for x in sampled_chemgraphs]).to("cpu")  # [BS, L, 3]
-    node_orientations = torch.stack([x.node_orientations for x in sampled_chemgraphs]).to(
-        "cpu"
-    )  # [BS, L, 3, 3]
-
+    pos = torch.cat(pos_chunks, dim=0)
+    node_orientations = torch.cat(orient_chunks, dim=0)
     return {"pos": pos, "node_orientations": node_orientations}
 
 
