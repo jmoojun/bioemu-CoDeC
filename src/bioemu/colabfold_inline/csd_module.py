@@ -383,6 +383,7 @@ def _agglomerative_cosine(
 
 def cluster_m_act_to_indices(
     m_act: np.ndarray,
+    msa_row_valid: np.ndarray,
     *,
     n_clusters: int,
     max_size: int,
@@ -408,6 +409,17 @@ def cluster_m_act_to_indices(
     Args:
         m_act: ``[N_seq, N_res, c_m]`` MSA representation **after** the first
             ``csd_block_idx + 1`` Evoformer blocks.  c_m is typically 256.
+            ``N_seq == max_msa_clusters``; AF2's data pipeline + ``_pad_input``
+            zero-pad the (deduplicated) MSA up to this size, so the trailing
+            rows are *padding*, not real sequences.
+        msa_row_valid: ``[N_seq]`` float ``{0, 1}`` flag — 1 for real MSA
+            rows, 0 for the zero-padding rows.  Padding rows MUST be excluded
+            from clustering: after 12 Evoformer blocks they are identical
+            garbage that collapses into a single cluster.  Every "member" of
+            that cluster has an all-zero original ``msa_mask`` — so
+            downstream ``msa_mask_batched`` zeroes them all out, and that
+            cluster's second-half Evoformer effectively runs on a query-only
+            MSA -> a completely broken single-sequence structure.
         n_clusters: Number of CoDeC clusters (= leading batch dim downstream).
         max_size: Maximum sequences per cluster *after padding*.  Mirrors
             openfold2's ``max_members = 128``.
@@ -421,15 +433,35 @@ def cluster_m_act_to_indices(
 
         The query (sequence 0) is forced into every cluster at slot 0.
     """
-    m_act_np = np.asarray(m_act, dtype=np.float32)
-    n_seq, n_res, c_m = m_act_np.shape
+    m_act_full = np.asarray(m_act, dtype=np.float32)
+    n_seq_full, n_res, c_m = m_act_full.shape
 
     device = _pick_device()
     rng = np.random.default_rng(rng_seed)
 
+    # ---- Drop zero-padding MSA rows BEFORE projector training / clustering.
+    # ``msa_row_valid[s] == 0`` marks rows that AF2 zero-padded the MSA with.
+    # ``valid_orig_idx`` maps "compact" indices back to original m_act rows;
+    # the query (index 0) is forced to be the first valid row so it lands at
+    # slot 0 of every cluster downstream.
+    valid_flag = np.asarray(msa_row_valid).reshape(-1) > 0.5
+    valid_flag[0] = True  # the query is always a real row
+    valid_orig_idx = np.where(valid_flag)[0].astype(np.int64)
+    if valid_orig_idx[0] != 0:
+        valid_orig_idx = np.concatenate(
+            [np.array([0], dtype=np.int64), valid_orig_idx[valid_orig_idx != 0]]
+        )
+    m_act_np = m_act_full[valid_orig_idx]  # [n_valid, n_res, c_m]
+    n_seq = int(m_act_np.shape[0])
+    logger.info(
+        "CoDeC: %d / %d MSA rows are real (non-padding); clustering only those.",
+        n_seq,
+        n_seq_full,
+    )
+
     logger.info(
         "CoDeC: project + cluster on post-block-11 MSA "
-        "(N_seq=%d, N_res=%d, c_m=%d, n_clusters=%d, max_size=%d, device=%s).",
+        "(N_valid=%d, N_res=%d, c_m=%d, n_clusters=%d, max_size=%d, device=%s).",
         n_seq,
         n_res,
         c_m,
@@ -537,9 +569,13 @@ def cluster_m_act_to_indices(
             # No non-query members for this cluster — query-only MSA.
             continue
 
-        # ``cluster_idxs_nonquery`` is indexed 0..N-2 over m_act[1:]; remap
-        # back to original m_act indices by adding 1.
-        members = np.where(cluster_idxs_nonquery == c)[0] + 1
+        # ``cluster_idxs_nonquery`` is indexed 0..n_valid-2 over the *valid*
+        # non-query rows (m_act_np[1:]).  ``valid_orig_idx[1:]`` maps those
+        # compact positions back to the ORIGINAL m_act row indices (which is
+        # what ``m_mid[seq_idx]`` gathers downstream).  This guarantees
+        # ``seq_idx`` only ever references real, non-padding MSA rows.
+        members_local = np.where(cluster_idxs_nonquery == c)[0]
+        members = valid_orig_idx[1:][members_local]
         if members.size > max_size - 1:
             members = rng.choice(members, max_size - 1, replace=False)
         seq_idx[c, 1 : 1 + members.size] = members.astype(np.int32)

@@ -2121,6 +2121,18 @@ class EmbeddingsAndEvoformer(hk.Module):
         m_mid = evoformer_mid['msa']    # [N_seq(+templ), L, c_m]
         z_mid = evoformer_mid['pair']   # [L, L, c_z]
 
+        # Per-row validity flag: AF2's data pipeline + _pad_input zero-pad
+        # the (deduplicated) MSA up to max_msa_clusters.  Those padding rows
+        # are identical garbage after 12 Evoformer blocks; if they enter
+        # CoDeC clustering they collapse into one cluster whose members all
+        # have an all-zero msa_mask -> that cluster's second half runs on an
+        # effectively query-only MSA -> a broken single-sequence structure.
+        # A real MSA row has a non-zero mask somewhere; pass this flag so
+        # the host callback can exclude padding rows from clustering.
+        msa_row_valid = (
+            jnp.sum(evoformer_masks['msa'], axis=-1) > 0
+        ).astype(jnp.float32)  # [N_seq(+templ)]
+
         # pure_callback runs on host: trains the projector on the actual
         # MSA representation (not raw one-hot), produces sequence-wise
         # latent vectors and clusters them.  Output shapes are fixed so
@@ -2135,6 +2147,7 @@ class EmbeddingsAndEvoformer(hk.Module):
                     (n_clusters_static, max_size_static), jnp.float32),
             ),
             m_mid.astype(jnp.float32),
+            msa_row_valid,
         )
         n_clusters_dyn = n_clusters_static
         seq_mask_d = seq_mask.astype(dtype)
